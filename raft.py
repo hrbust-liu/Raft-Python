@@ -1,15 +1,14 @@
 
 # coding: utf-8
 
-import os
 from random import randint
 import time
-import socket
 import json
 import sys
 import random
 
 from common.log import Logger
+from common.network import Network
 
 '''
 Follower: 接收数据，反馈
@@ -17,7 +16,7 @@ Candidate:
 Leader:
 
 msg {
-    "rpcType" : "RequestForVote/ResponseForVote/AppendEntries/AppendEntriesResponse"
+    "rpcType" : "RequestForVote/ResponseForVote/AppendEntries/AppendEntriesResponse/UserRequest/UserResponse"
     "sendRole" : "leader/follower/candidate/client"
     "ip"" : ""
     "data": ""
@@ -25,27 +24,33 @@ msg {
 
 '''
 
+def str2ip_port(ip_port):
+    return (ip_port.split(':')[0], int(ip_port.split(':')[1]))
+
 class RaftServer:
     def __init__(self, port, peers):
         self.status = "Follower"
         self.logger = Logger().logger
 
         self.ip = "127.0.0.1"
-        self.leader_ip_port = ("", 0)
         self.port = int(port)
         self.me = (self.ip, self.port)
         self.peers = []
+
         for ip_port in peers.split(','):
-            node = self.str2ip_port(ip_port)
+            node = str2ip_port(ip_port)
             if node == self.me:
                 continue
             self.peers.append(node)
+        
+        self.peersNum = len(self.peers) + 1
 
         self.logger.info("peers: %s"%(self.peers))
-        # self.peers = [("127.0.0.1", 7800), ("127.0.0.1", 7801), ("127.0.0.1", 7802)]
 
-        self.addr = ('127.0.01', self.port)
-        self.init_for_recv()
+        self.addrNet = ('127.0.01', self.port)
+        self.addrStr = "127.0.0.1:" + str(self.port)
+
+        self.net = Network(self.addrNet)
 
         self.voteFor = ""
         self.log = []
@@ -56,23 +61,15 @@ class RaftServer:
 
         self.select_leader_time = 0
 
-    def str2ip_port(self, ip_port):
-        return (ip_port.split(':')[0], int(ip_port.split(':')[1]))
+        self.commitIndex = 0
+        self.applyIndex = 0
+        self.nodeCommitIndex = {}
+        self.nodeApplyIndex = {}
 
-    def init_for_recv(self):
-        self.s_recv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.s_recv.bind(self.addr)
-        self.s_recv.settimeout(2)
+        self.applyNum = {}
 
-        self.s_send = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.kv = {}
 
-    def recv(self):
-        msg, addr = self.s_recv.recvfrom(65535)
-        return json.loads(msg), addr
-    
-    def send(self, msg, addr):
-        msg = json.dumps(msg).encode('utf-8')
-        self.s_send.sendto(msg, addr)
 
     def become_follower(self):
         self.updateHeart()
@@ -98,15 +95,19 @@ class RaftServer:
                 'rpcType': 'RequestForVote',
                 'ip': self.ip,
                 'port': self.port,
-                'term': self.currentTerm
+                'term': self.currentTerm,
+                "addr": self.addrStr,
+                'end': 'end'
             }
-            self.send(request, node)
+            self.net.send(request, node)
 
     def become_leader(self):
         self.status = "Leader"
         self.beartTime = {}
         for node in self.peers:
             self.beartTime[node] = 0
+            self.nodeCommitIndex[node] = 0
+        self.clientMap = {}
 
     def updateHeart(self):
         self.select_leader_time = time.time() + 2 + random.randint(0, 1000)/1000.0
@@ -114,6 +115,24 @@ class RaftServer:
     def ShortToString(self):
         # Leader(127.0.0.1:1234): term(11)
         return "%s(%s:%s): term(%s)"%(self.status, self.ip, self.port, self.currentTerm)
+
+    def updateData(self, data):
+        startLogIndex = int(data['startLogIndex'])
+        endLogIndex = int(data['endLogIndex'])
+        if startLogIndex > self.commitIndex or self.commitIndex >= endLogIndex:
+            return
+        logOffset = self.commitIndex - startLogIndex
+        for index in range(self.commitIndex, endLogIndex):
+            self.log.append(data['log'][logOffset + index])
+        self.commitIndex = endLogIndex
+
+    def AppendDateResponse(self):
+        data = {
+            'addr': self.me,
+            "commitIndex": self.commitIndex,
+            "applyIndex": self.applyIndex,
+            "end": "end"
+        }
 
     def do_follower(self):
         '''
@@ -123,15 +142,19 @@ class RaftServer:
                   如果收到 client -> 反错，返回Leader
         '''
         try:
-            msg, addr = self.recv()
+            msg, addr = self.net.recv()
         except Exception as e:
             # 心跳超时，准备选主
             if time.time() > self.select_leader_time:
                 self.become_candidate()
+            msg = None
+            addr = None
             return
 
         # 投票/追加数据
-        if msg['rpcType'] == "RequestForVote":
+        if msg == None:
+            pass
+        elif msg['rpcType'] == "RequestForVote":
             if msg['term'] > self.currentTerm:
                 self.currentTerm = msg['term']
                 self.voteFor = msg['ip'] + ":" + str(msg['port'])
@@ -141,20 +164,21 @@ class RaftServer:
                 pass
             else:
                 pass
+        elif msg['rpcType'] == "ResponseForVote":
+            pass
         elif msg['rpcType'] == "AppendEntries":
-            if msg['term'] > self.currentTerm:
+            if msg['term'] >= self.currentTerm:
                 self.currentTerm = msg['term']
-                self.leader_ip_port = (msg['leader_ip'], int(msg['leader_port']))
-                self.voteFor = msg['ip'] + ":" + str(msg['port'])
+                self.voteFor = msg['addr']
                 self.updateHeart()
-            elif msg['term'] == self.currentTerm:
-                self.updateHeart()
-                if (msg['leader_ip'], int(msg['leader_port'])) == self.leader_ip_port:
-                    pass
-                else:
-                    pass
+                self.updateData(msg)
+                self.AppendDateResponse()
             else:
                 pass
+        elif msg['rpcType'] == "AppendEntriesResponse":
+            pass
+        elif msg['rpcType'] == 'UserRequest':
+            self.UserResponse(msg['addr'], error = "NotLeader")
 
     def do_candidate(self):
         '''
@@ -165,7 +189,7 @@ class RaftServer:
         '''
 
         try:
-            msg, addr = self.recv()
+            msg, addr = self.net.recv()
         except Exception as e:
             if time.time() > self.select_leader_time:
                 self.become_candidate()
@@ -177,7 +201,7 @@ class RaftServer:
                 if msg['term'] > self.currentTerm:
                     request = msg
                     self.currentTerm = msg['term']
-                    self.voteFor = msg['ip'] + ":" + str(msg['port'])
+                    self.voteFor = msg['addr']
                     self.voteResponse(request)
                     self.become_follower()
                 elif msg['term'] == self.currentTerm:
@@ -188,7 +212,7 @@ class RaftServer:
                 if msg['term'] == self.currentTerm:
                     node = (msg['ip'], int(msg['port']))
                     self.vote_id[node] = msg['voteFor']
-                    if (self.str2ip_port(msg['voteFor'])) == self.me:
+                    if (str2ip_port(msg['voteFor'])) == self.me:
                         print("I get %s vote"%(str(node)))
                         self.voteNum += 1
                         if self.voteNum * 2  >= len(self.peers) + 1:
@@ -196,7 +220,7 @@ class RaftServer:
                 elif msg['term'] > self.currentTerm:
                     request = msg
                     self.currentTerm = msg['term']
-                    self.voteFor = msg['ip'] + ":" + str(msg['port'])
+                    self.voteFor = msg['addr']
                     self.voteResponse(request)
                     self.become_follower()
                 else:
@@ -204,11 +228,12 @@ class RaftServer:
             elif msg['rpcType'] == "AppendEntries":
                 if msg['term'] >= self.currentTerm:
                     self.currentTerm = msg['term']
-                    self.leader_ip_port = (msg['leader_ip'], int(msg['leader_port']))
-                    self.voteFor = msg['ip'] + ":" + str(msg['port'])
+                    self.voteFor = msg['addr']
                     self.become_follower()
                 elif msg['term'] < self.currentTerm:
                     pass
+            elif msg['rpcType'] == 'UserRequest':
+                self.UserResponse(msg['addr'], error = "Candaditing")
 
     def do_leader(self):
         '''
@@ -219,22 +244,12 @@ class RaftServer:
         '''
         now = time.time()
         for node in self.peers:
-            if now > self.beartTime[node] + self.sendHeartTime:
-                self.beartTime[node] = now
-                request = {
-                    "rpcType": "AppendEntries",
-                    "log" : "",
-                    "term" : self.currentTerm,
-                    "ip" : self.ip,
-                    "port" : self.port,
-                    "leader_ip" : self.me[0],
-                    "leader_port" : self.me[1],
-                    "end" : "end"
-                }
-                self.send(request, node)
+            startLogIndex = self.nodeCommitIndex[node]
+            if startLogIndex < self.commitIndex or (now > self.beartTime[node] + self.sendHeartTime):
+                self.AppendDateRequest(node, startLogIndex, self.commitIndex)
 
         try:
-            msg, addr = self.recv()
+            msg, addr = self.net.recv()
         except Exception as e:
             msg = None
             addr = None
@@ -242,8 +257,7 @@ class RaftServer:
             if msg['rpcType'] == "AppendEntries":
                 if msg['term'] > self.currentTerm:
                     self.currentTerm = msg['term']
-                    self.leader_ip_port = (msg['leader_ip'], int(msg['leader_port']))
-                    self.voteFor = msg['ip'] + ":" + str(msg['port'])
+                    self.voteFor = msg['addr']
                     self.become_follower()
                 elif msg['term'] < self.currentTerm:
                     pass
@@ -253,11 +267,54 @@ class RaftServer:
                 request = msg
                 if msg['term'] > self.currentTerm:
                     self.currentTerm = msg['term']
-                    self.voteFor = msg['ip'] + ":" + str(msg['port'])
+                    self.voteFor = msg['addr']
                     self.voteResponse(request)
                     self.become_follower()
                 elif msg['term'] <= self.currentTerm:
                     pass
+            elif msg['rpcType'] == "ResponseForVote":
+                pass
+            elif msg['rpcType'] == 'UserRequest':
+                print("收到User Request:%s"%(msg))
+                # 发送给所有follower，如果过半同意，则回复client成功
+                self.log.append(msg['key'] + ":" + msg['value'])
+                self.clientMap[self.commitIndex] = msg['addr']
+                self.applyNum[self.commitIndex] = 1
+                self.commitIndex += 1
+            elif msg['rpcType'] == 'AppendEntriesResponse':
+                node = str2ip_port(msg['addr'])
+                self.nodeCommitIndex[node] = int(msg['commitIndex'])
+                self.nodeApplyIndex[node] = int(msg['applyIndex'])
+                index = self.nodeCommitIndex[node]
+                hasApplyIndex = self.applyIndex
+                while index > hasApplyIndex:
+                    self.applyNum[index] += 1
+                    if self.applyNum[index] > self.peersNum/2:
+                        self.applyIndex = hasApplyIndex
+                        self.UserResponse(self.clientMap[hasApplyIndex])
+                        key = self.log[hasApplyIndex].split(':')[0]
+                        value = self.log[hasApplyIndex].split(':')[1]
+                        self.kv[key] = value
+                    hasApplyIndex += 1
+
+    # append [startLogIndex, endLogIndex)
+    def AppendDateRequest(self, node, startLogIndex, endLogIndex):
+        self.beartTime[node] = time.time()
+        request = {
+            "rpcType": "AppendEntries",
+            "log" : self.log[startLogIndex:endLogIndex],
+            "startLogIndex": startLogIndex,
+            "endLogIndex": endLogIndex,
+            "applyIndex": self.applyIndex,
+            "term" : self.currentTerm,
+            "ip" : self.ip,
+            "port" : self.port,
+            "addr": self.addrStr,
+            "end" : "end"
+        }
+        self.net.send(request, node)
+        self.nodeCommitIndex[node] = endLogIndex
+
 
     def voteResponse(self, request):
         addr = (request["ip"], request["port"])
@@ -269,7 +326,18 @@ class RaftServer:
             "term": self.currentTerm,
             "end": "end"
         }
-        self.send(data, addr)
+        self.net.send(data, addr)
+
+    def UserResponse(self, addrStr, error = "OK"):
+        addr = str2ip_port(addrStr)
+        data = {
+            'rpcType': 'UserResponse',
+            'error': error,
+            'voteFor': self.voteFor,
+            "end" : "end"
+        }
+        self.net.send(data, addr)
+        print("res: data: %s, addr: %s"%(data, addr))
 
     def run(self):
         while True:

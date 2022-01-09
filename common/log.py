@@ -9,7 +9,7 @@ LOG_FMT= '%(asctime)s %(filename)s [line:%(lineno)d] %(levelname)s %(message)s'
 #默认的时间格式
 LOG_DATEFMT='%Y-%m-%d %H:%M:%S'
 #默认日志文件名称
-LOG_FILENAME='log'
+LOG_FILENAME='log/log'
 
 class Logger(object):
     def __init__(self):
